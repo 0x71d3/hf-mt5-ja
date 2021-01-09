@@ -1,0 +1,4 @@
+stc-jpn/*.tsv
+
+*.sh
+mt5_stc-jpn/*
