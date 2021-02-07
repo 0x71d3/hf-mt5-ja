@@ -2,3 +2,5 @@ stc-jpn/*.tsv
 
 *.sh
 mt5_stc-jpn/*
+
+lightning_logs/

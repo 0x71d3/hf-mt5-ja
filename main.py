@@ -5,14 +5,16 @@ import shutil
 
 import torch
 from torch.utils.data import Dataset, DataLoader
-import pytorch_lightning as pl
+from pytorch_lightning import LightningModule, Trainer, seed_everything
 from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from transformers import (
     T5Tokenizer,
     MT5ForConditionalGeneration,
     AdamW,
     get_linear_schedule_with_warmup
 )
+from transformers.models.bart.modeling_bart import shift_tokens_right
 
 
 class DialogueDataset(Dataset):
@@ -68,7 +70,7 @@ def label_smoothed_nll_loss(lprobs, target, epsilon, ignore_index=-100):
     return loss, nll_loss
 
 
-class MT5Trainer(pl.LightningModule):
+class MT5Trainer(LightningModule):
     def __init__(self, params):
         super().__init__()
         self.save_hyperparameters(params)
@@ -78,12 +80,17 @@ class MT5Trainer(pl.LightningModule):
             'google/mt5-small'
         )
 
-        # dataset
-        self.train_dataset = DialogueDataset(
+        # loader
+        dataset = DialogueDataset(
             data_dir=self.hparams.data_dir,
             split='train',
             tokenizer=self.tokenizer,
             max_length=self.hparams.max_length
+        )
+        self.train_loader = DataLoader(
+            dataset=dataset,
+            batch_size=self.hparams.train_batch_size,
+            shuffle=True
         )
 
     def forward(self, input_ids, attention_mask, decoder_input_ids):
@@ -100,7 +107,7 @@ class MT5Trainer(pl.LightningModule):
         attention_mask = batch['attention_mask']
         labels = batch['labels']
 
-        decoder_input_ids = self.model._shift_right(labels)
+        decoder_input_ids = shift_tokens_right(labels, pad_token_id)
 
         outputs = self(
             input_ids=input_ids,
@@ -108,7 +115,7 @@ class MT5Trainer(pl.LightningModule):
             decoder_input_ids=decoder_input_ids
         )
         
-        logits = outputs.logits
+        logits = outputs[0]
         lprobs = torch.nn.functional.log_softmax(logits, dim=-1)
         loss, nll_loss = label_smoothed_nll_loss(
             lprobs=lprobs,
@@ -127,7 +134,7 @@ class MT5Trainer(pl.LightningModule):
         attention_mask = batch['attention_mask']
         labels = batch['labels']
 
-        decoder_input_ids = self.model._shift_right(labels)
+        decoder_input_ids = shift_tokens_right(labels, pad_token_id)
 
         outputs = self(
             input_ids=input_ids,
@@ -135,7 +142,7 @@ class MT5Trainer(pl.LightningModule):
             decoder_input_ids=decoder_input_ids
         )
         
-        logits = outputs.logits
+        logits = outputs[0]
         lprobs = torch.nn.functional.log_softmax(logits, dim=-1)
         loss, nll_loss = label_smoothed_nll_loss(
             lprobs=lprobs,
@@ -145,7 +152,6 @@ class MT5Trainer(pl.LightningModule):
         )
 
         self.log('val_loss', loss, prog_bar=True)
-        return loss
     
     def test_step(self, batch, batch_idx):
         input_ids = batch['input_ids']
@@ -165,9 +171,12 @@ class MT5Trainer(pl.LightningModule):
             self.tokenizer.decode(beam_output, skip_special_tokens=True)
             for beam_output in beam_outputs
         ]
+        return preds
 
-        with open(os.path.join(self.hparams.output_dir, 'preds.txt'), 'a') as f:
-            f.write('\n'.join(preds) + '\n')
+    def test_epoch_end(self, outputs):
+        with open(os.path.join(self.hparams.output_dir, 'preds.txt'), 'w') as f:
+            for output in outputs:
+                f.write('\n'.join(output) + '\n')
 
     def configure_optimizers(self):
         # optimizer
@@ -178,46 +187,41 @@ class MT5Trainer(pl.LightningModule):
                     p for n, p in self.model.named_parameters()
                     if not any(nd in n for nd in no_decay)
                 ],
-                'weight_decay': self.hparams.weight_decay,
+                'weight_decay': self.hparams.weight_decay
             },
             {
                 'params': [
                     p for n, p in self.model.named_parameters()
                     if any(nd in n for nd in no_decay)
                 ],
-                'weight_decay': 0.0,
+                'weight_decay': 0.0
             },
         ]
+        betas = tuple(map(float, self.hparams.adam_betas[1:-1].split(',')))
         optimizer = AdamW(
             optimizer_grouped_parameters,
-            lr=self.hparams.learning_rate
+            betas=betas,
+            eps=self.hparams.adam_eps,
+            lr=self.hparams.lr
         )
 
         # scheduler
         num_training_steps = (
-            (
-                (len(self.train_dataset) - 1)
-                // (self.hparams.train_batch_size * self.hparams.gpus)
-            )
+            len(self.train_loader)
             // self.hparams.accumulate_grad_batches
             * self.hparams.max_epochs
         )
-        scheduler = get_linear_schedule_with_warmup(
+        lr_scheduler = get_linear_schedule_with_warmup(
             optimizer,
             num_warmup_steps=self.hparams.num_warmup_steps,
             num_training_steps=num_training_steps
         )
+        lr_dict = {'scheduler': lr_scheduler, 'interval': 'step'}
 
-        return [optimizer], [scheduler]
+        return [optimizer], [lr_dict]
 
     def train_dataloader(self):
-        loader = DataLoader(
-            dataset=self.train_dataset,
-            batch_size=self.hparams.train_batch_size,
-            shuffle=True,
-            num_workers=4
-        )
-        return loader
+        return self.train_loader
 
     def val_dataloader(self):
         dataset = DialogueDataset(
@@ -228,8 +232,7 @@ class MT5Trainer(pl.LightningModule):
         )
         loader = DataLoader(
             dataset=dataset,
-            batch_size=self.hparams.val_batch_size,
-            num_workers=4
+            batch_size=self.hparams.val_batch_size
         )
         return loader
 
@@ -242,8 +245,7 @@ class MT5Trainer(pl.LightningModule):
         )
         loader = DataLoader(
             dataset=dataset,
-            batch_size=self.hparams.val_batch_size,
-            num_workers=4
+            batch_size=self.hparams.val_batch_size
         )
         return loader
 
@@ -254,39 +256,45 @@ def main():
     parser.add_argument('data_dir')
     parser.add_argument('output_dir')
 
-    parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--gpus', type=int, default=1)
+    parser.add_argument('--seed', default=42, type=int)
 
-    parser.add_argument('--gradient_clip_val', type=float, default=0.1)
+    parser.add_argument('--label_smoothing', default=0.1, type=float)
+    parser.add_argument('--weight_decay', default=0.1, type=float)
+    parser.add_argument('--lr', default=1e-4, type=float)
+    parser.add_argument('--adam_betas', default='(0.9,0.999)')
+    parser.add_argument('--adam_eps', default=1e-6, type=float)
+    parser.add_argument('--num_warmup_steps', default=500, type=int)
 
-    parser.add_argument('--max_length', type=int, default=64)
-    parser.add_argument('--max_epochs', type=int, default=4)
-    parser.add_argument('--accumulate_grad_batches', type=int, default=1)
-    parser.add_argument('--label_smoothing', type=float, default=0.1)
-    parser.add_argument('--num_warmup_steps', type=int, default=0)
-    parser.add_argument('--weight_decay', type=float, default=0.1)
-    parser.add_argument('--learning_rate', type=float, default=1e-4)
+    parser.add_argument('--train_batch_size', default=16, type=int)
+    parser.add_argument('--val_batch_size', default=16, type=int)
+    parser.add_argument('--max_length', default=128, type=int)
 
-    parser.add_argument('--train_batch_size', type=int, default=16)
-    parser.add_argument('--val_batch_size', type=int, default=16)
+    parser.add_argument('--accumulate_grad_batches', default=4, type=int)
+    parser.add_argument('--gpus', default=1, type=int)
+    parser.add_argument('--gradient_clip_val', default=0.1, type=float)
+    parser.add_argument('--max_epochs', default=2, type=int)
 
     args = parser.parse_args()
-
+    
     if os.path.isdir(args.output_dir):
         shutil.rmtree(args.output_dir)
     os.mkdir(args.output_dir)
+
+    seed_everything(args.seed)
 
     checkpoint_callback = ModelCheckpoint(
         monitor='val_loss',
         mode='min',
         dirpath=args.output_dir
     )
-    trainer = pl.Trainer(
-        callbacks=[checkpoint_callback],
+    early_stop_callback = EarlyStopping(monitor='val_loss', mode='min')
+    trainer = Trainer(
+        accumulate_grad_batches=args.accumulate_grad_batches,
+        callbacks=[checkpoint_callback, early_stop_callback],
+        deterministic=True,
         gradient_clip_val=args.gradient_clip_val,
         gpus=args.gpus,
-        accumulate_grad_batches=args.accumulate_grad_batches,
-        max_epochs=args.max_epochs,
+        max_epochs=args.max_epochs
     )
 
     model = MT5Trainer(args)
